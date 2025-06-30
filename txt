@@ -1,0 +1,7 @@
+🔧 И не забудь в models.Server добавить поля:
+
+go
+Копировать
+Редактировать
+ICMPID  int       `json:"icmp_id"`
+Failures int      `json:"failures"`
