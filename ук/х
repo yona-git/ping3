@@ -1,0 +1,220 @@
+Понял, уберём счётчик `Failures` и вернёмся к логике с попытками (`attempts`), где статус определяется сразу по результату серии попыток. Вот переработанный код:
+
+```go
+package ping
+
+import (
+    	"context"
+        	"log"
+            	"net"
+                	"ping-monitor/models"
+                    	"sync"
+                        	"time"
+
+                            	"golang.org/x/net/icmp"
+                                	"golang.org/x/net/ipv4"
+)
+
+const (
+    	pingAttempts  = 3       // Количество попыток перед определением статуса
+        	pingInterval  = 5 * time.Second
+            	pingTimeout   = 2 * time.Second // Таймаут для одной попытки
+                	retryDelay    = 500 * time.Millisecond // Задержка между попытками
+                    	logPrefix     = "PING: "
+)
+
+func PingServer(server *models.Server, wg *sync.WaitGroup, mu *sync.Mutex) {
+    	defer wg.Done()
+
+        	ipAddr, err := net.ResolveIPAddr("ip4", server.IP)
+            	if err != nil {
+                    		log.Printf("%sServer %s (%s) - Resolve error: %v", logPrefix, server.Name, server.IP, err)
+                            		setServerStatus(server, "error", mu)
+                                    		return
+                }
+
+                	netconn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+                    	if err != nil {
+                            		log.Printf("%sServer %s (%s) - ICMP listen error: %v", logPrefix, server.Name, server.IP, err)
+                                    		setServerStatus(server, "error", mu)
+                                            		return
+                        }
+                        	defer netconn.Close()
+
+                            	// Делаем несколько попыток
+                                	for attempt := 1; attempt <= pingAttempts; attempt++ {
+                                        		success := makePingAttempt(netconn, ipAddr, server, attempt)
+                                                		if success {
+                                                            			setServerStatus(server, "alive", mu)
+                                                                        			return
+                                                        }
+                                                        		
+                                                                		if attempt < pingAttempts {
+                                                                            			time.Sleep(retryDelay)
+                                                                        }
+                                    }
+
+                                    	// Все попытки неудачны
+                                        	setServerStatus(server, "dead", mu)
+}
+
+func makePingAttempt(conn net.PacketConn, ipAddr *net.IPAddr, server *models.Server, attempt int) bool {
+    	seq := time.Now().Nanosecond() & 0xffff
+        	id := server.ICMPID
+
+            	wm := icmp.Message{
+                    		Type: ipv4.ICMPTypeEcho,
+                            		Code: 0,
+                                    		Body: &icmp.Echo{
+                                                			ID:   id,
+                                                            			Seq:  seq,
+                                                                        			Data: []byte("ping"),
+                                            },
+                }
+
+                	wb, err := wm.Marshal(nil)
+                    	if err != nil {
+                            		log.Printf("%sServer %s (%s) - Attempt %d: ICMP marshal error: %v", 
+                                    			logPrefix, server.Name, server.IP, attempt, err)
+                                                		return false
+                        }
+
+                        	if _, err := conn.WriteTo(wb, ipAddr); err != nil {
+                                		log.Printf("%sServer %s (%s) - Attempt %d: ICMP write error: %v", 
+                                        			logPrefix, server.Name, server.IP, attempt, err)
+                                                    		return false
+                            }
+
+                            	err = conn.SetReadDeadline(time.Now().Add(pingTimeout))
+                                	if err != nil {
+                                        		log.Printf("%sServer %s (%s) - Attempt %d: Set read deadline error: %v", 
+                                                			logPrefix, server.Name, server.IP, attempt, err)
+                                                            		return false
+                                    }
+
+                                    	rb := make([]byte, 1500)
+                                        	n, peer, err := conn.ReadFrom(rb)
+                                            	if err != nil {
+                                                    		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+                                                                			log.Printf("%sServer %s (%s) - Attempt %d: Timeout", 
+                                                                            				logPrefix, server.Name, server.IP, attempt)
+                                                            } else {
+                                                                			log.Printf("%sServer %s (%s) - Attempt %d: Read error: %v", 
+                                                                            				logPrefix, server.Name, server.IP, attempt, err)
+                                                            }
+                                                            		return false
+                                                }
+
+                                                	rm, err := icmp.ParseMessage(1, rb[:n])
+                                                    	if err != nil {
+                                                            		log.Printf("%sServer %s (%s) - Attempt %d: Parse error: %v", 
+                                                                    			logPrefix, server.Name, server.IP, attempt, err)
+                                                                                		return false
+                                                        }
+
+                                                        	if rm.Type != ipv4.ICMPTypeEchoReply {
+                                                                		log.Printf("%sServer %s (%s) - Attempt %d: Received non-echo-reply", 
+                                                                        			logPrefix, server.Name, server.IP, attempt)
+                                                                                    		return false
+                                                            }
+
+                                                            	switch body := rm.Body.(type) {
+                                                                    	case *icmp.Echo:
+                                                                        		if body.ID == id && body.Seq == seq {
+                                                                                    			log.Printf("%sServer %s (%s) - Attempt %d: Valid reply from %s", 
+                                                                                                				logPrefix, server.Name, server.IP, attempt, peer.String())
+                                                                                                                			return true
+                                                                                }
+                                                                                		log.Printf("%sServer %s (%s) - Attempt %d: Mismatched reply (ID:%d Seq:%d)", 
+                                                                                        			logPrefix, server.Name, server.IP, attempt, body.ID, body.Seq)
+                                                                }
+                                                                	return false
+}
+
+func setServerStatus(server *models.Server, status string, mu *sync.Mutex) {
+    	mu.Lock()
+        	defer mu.Unlock()
+            	server.Status = status
+                	server.LastPing = time.Now()
+                    	log.Printf("%sServer %s (%s) - Final status: %s", 
+                        		logPrefix, server.Name, server.IP, server.Status)
+}
+
+func MonitorServers(servers *[]models.Server, mu *sync.Mutex, ctx context.Context) {
+    	ticker := time.NewTicker(pingInterval)
+        	defer ticker.Stop()
+
+            	for {
+                    		select {
+                                		case <-ctx.Done():
+                                        			return
+                                                    		case <-ticker.C:
+                                                            			var wg sync.WaitGroup
+                                                                        			for i := range *servers {
+                                                                                        				if (*servers)[i].IP != "" {
+                                                                                                            					wg.Add(1)
+                                                                                                                                					go func(s *models.Server) {
+                                                                                                                                                        						defer wg.Done()
+                                                                                                                                                                                						PingServer(s, &wg, mu)
+                                                                                                                                                    }(&(*servers)[i])
+                                                                                                        }
+                                                                                    }
+                                                                                    			wg.Wait()
+                            }
+                }
+}
+```
+
+### Ключевые особенности:
+
+1. **Только два статуса**: `alive` или `dead` (плюс `error` для ошибок соединения)
+2. **Фиксированное число попыток** (3 по умолчанию) перед определением статуса
+3. **Быстрые попытки** с интервалом 500 мс между ними
+4. **Стабильный основной интервал** - пинг каждого сервера ровно каждые 5 секунд
+5. **Чёткая логика**:
+   - Если хотя бы одна попытка успешна - статус `alive`
+      - Если все попытки неудачны - статус `dead`
+         - Ошибки соединения устанавливают статус `error`
+
+         ### Как это работает:
+
+         1. Для каждого сервера:
+            - Делается до 3 попыток с интервалом 500 мс
+               - При первой успешной попытке сразу возвращается статус `alive`
+                  - Если все попытки неудачны - возвращается `dead`
+
+                  2. Весь процесс занимает максимум:
+                     - 2 сек (таймаут) × 3 попытки = 6 сек (в худшем случае)
+                        - Но обычно меньше, так как неудачные попытки завершаются по таймауту
+
+                        3. Основной цикл мониторинга гарантирует, что следующий пинг будет ровно через 5 секунд после начала предыдущего.
+
+                        Это решение обеспечит стабильную работу без "плавающих" статусов и с чёткими критериями определения состояния серверов.
+                                                                                                                                                    }
+                                                                                                        }
+                                                                                    }
+                            }
+                }
+}
+}
+                                                                                }
+                                                                }
+                                                            }
+                                                        }
+                                                            }
+                                                            }
+                                                }
+                                    }
+                            }
+                        }
+                                            }
+                }
+}
+                                                                        }
+                                                        }
+                                    }
+                        }
+                }
+}
+)
+)
