@@ -1,0 +1,178 @@
+Я понимаю, что вам нужно изменить формат ответа сервера, чтобы он соответствовал указанной структуре. Давайте исправим код сервера (log_service.go) для правильного формирования ответа.
+
+Вот исправленная версия:
+
+```go
+func (s *grpcserver) Command(ctx context.Context, req *pb.DevRequest) (*pb.DevResponse, error) {
+        log.Printf("Received Command: %v", req.GetCommand())
+            log.Printf("Received Params: %v", req.GetParams())
+
+                command := req.GetCommand()
+
+                    // Создаем структуру для ответа
+                        response := struct {
+                                    Error  string      `json:"error"`
+                                            Result interface{} `json:"result"`
+                        }{
+                                    Error:  "",
+                                            Result: nil,
+                        }
+
+                            var statusCode pb.StatusCode
+
+                                ex, err := os.Executable()
+                                    if err != nil {
+                                                response.Error = fmt.Sprintf("Failed to get executable path: %v", err)
+                                                        statusCode = pb.StatusCode_Failed
+                                                                log.Printf("Error getting executable path: %v", err)
+                                                                        return createResponse(response, statusCode)
+                                    }
+                                        
+                                            exPath := filepath.Dir(ex)
+                                                logFolderPath := filepath.Join(exPath, defaultLogFolder)
+                                                    log.Printf("Log folder path: %s", logFolderPath)
+
+                                                        switch command {
+                                                                case "GET_LOG":
+                                                                        latestLogFile, err := findLatestLogFile(logFolderPath)
+                                                                                if err != nil {
+                                                                                                response.Error = fmt.Sprintf("Failed to find latest log file: %v", err)
+                                                                                                            statusCode = pb.StatusCode_Failed
+                                                                                                                        log.Printf("Error finding latest log file: %v", err)
+                                                                                                                                    break
+                                                                                }
+
+                                                                                        if latestLogFile == "" {
+                                                                                                        response.Error = "No log files found in the specified folder"
+                                                                                                                    statusCode = pb.StatusCode_Failed
+                                                                                                                                log.Printf("No log files found in %s", logFolderPath)
+                                                                                                                                            break
+                                                                                        }
+
+                                                                                                logFilePath := filepath.Join(logFolderPath, latestLogFile)
+                                                                                                        log.Printf("Parsing log file: %s", logFilePath)
+
+                                                                                                                logMessages, err := ParseLogs(logFilePath)
+                                                                                                                        if err != nil {
+                                                                                                                                        response.Error = fmt.Sprintf("Failed to parse logs: %v", err)
+                                                                                                                                                    statusCode = pb.StatusCode_Failed
+                                                                                                                                                                log.Printf("Error parsing logs: %v", err)
+                                                                                                                        } else {
+                                                                                                                                        response.Result = logMessages // Отправляем массив сообщений напрямую
+                                                                                                                                                    statusCode = pb.StatusCode_Ok
+                                                                                                                        }
+                                                                                                                            default:
+                                                                                                                                    response.Error = "Unknown command"
+                                                                                                                                            statusCode = pb.StatusCode_Failed
+                                                        }
+
+                                                            return createResponse(response, statusCode)
+}
+
+// Вспомогательная функция для создания ответа
+func createResponse(responseData interface{}, statusCode pb.StatusCode) (*pb.DevResponse, error) {
+        // Сериализуем responseData в JSON
+            responseBytes, err := json.Marshal(responseData)
+                if err != nil {
+                            return nil, fmt.Errorf("failed to marshal response JSON: %w", err)
+                }
+
+                    return &pb.DevResponse{
+                                Response: string(responseBytes),
+                                        Code:     statusCode,
+                    }, nil
+}
+```
+
+Ключевые изменения:
+
+1. Изменил структуру ответа - теперь она содержит:
+   - `error` - строка с описанием ошибки
+      - `result` - интерфейс, который может содержать либо строку, либо массив логов
+
+      2. Добавил вспомогательную функцию `createResponse` для унификации создания ответов
+
+      3. Теперь при успешном выполнении команды GET_LOG в `result` передается непосредственно массив объектов LogMessage, а не их JSON-сериализация
+
+      4. В случае ошибки в `error` передается описание ошибки, а `result` остается пустым
+
+      Примеры ответов:
+
+      При ошибке:
+      ```json
+      {
+          "code": "Failed",
+            "response": "{\"error\": \"Some error\", \"result\": null}"
+      }
+      ```
+
+      При успехе:
+      ```json
+      {
+          "code": "Ok",
+            "response": "{\"error\": \"\", \"result\": [{\"channel\": \"...\", \"full_time\": \"...\", ...}, {...}]}"
+      }
+      ```
+
+      Также вам нужно обновить клиентскую часть, чтобы она правильно обрабатывала новый формат ответа. В клиенте (main.go) измените обработку ответа:
+
+      ```go
+      var responseData struct {
+            Error  string          `json:"error"`
+                Result json.RawMessage `json:"result"` // Используем RawMessage для гибкости
+      }
+
+      if err := json.Unmarshal([]byte(r.GetResponse()), &responseData); err != nil {
+            log.Fatalf("failed to unmarshal response JSON: %v", err)
+      }
+
+      // Обработка статуса
+      var statusCode string
+      switch r.GetCode() {
+        case pb.StatusCode_Ok:
+            statusCode = "Ok"
+                // Парсим результат только если статус Ok
+                    var logMessages []LogMessage
+                        if err := json.Unmarshal(responseData.Result, &logMessages); err != nil {
+                                    log.Printf("Warning: failed to unmarshal log messages: %v", err)
+                        } else {
+                                    fmt.Printf("Log Messages:\n")
+                                            for _, logMessage := range logMessages {
+                                                            fmt.Printf("%+v\n", logMessage)
+                                            }
+                        }
+                        case pb.StatusCode_Failed:
+                            statusCode = "Failed"
+                            default:
+                                statusCode = "Unknown"
+      }
+
+      fmt.Printf("Code: %s\n", statusCode)
+      fmt.Printf("Error: %s\n", responseData.Error)
+      ```
+
+      Эти изменения обеспечивают:
+      1. Более четкое разделение между успешными ответами и ошибками
+      2. Возможность передавать структурированные данные в поле result
+      3. Соответствие требуемому формату ответа
+      4. Более гибкую обработку разных типов результатов
+                                            }
+                        }
+                        }
+      }
+      }
+      }
+      }
+      }
+                    }
+                }
+}
+                                                                                                                        }
+                                                                                                                        }
+                                                                                        }
+                                                                                }
+                                                        }
+                                    }
+                        }
+                        }
+}
