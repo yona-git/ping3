@@ -1,0 +1,321 @@
+Я понял ваши требования. Давайте полностью переработаем серверную часть, чтобы она:
+
+1. Брала путь из конфига (root_folder) + group_name + service_name + logs
+2. Находила самый свежий лог-файл
+3. Парсила его и возвращала логи в указанном формате
+4. Форматировала ответ строго по заданному шаблону
+
+Вот исправленная реализация:
+
+### 1. Добавим конфигурацию (config.go)
+```go
+package log_service
+
+import (
+    	"encoding/json"
+        	"os"
+)
+
+type Config struct {
+    	RootFolder string `json:"root_folder"`
+}
+
+func LoadConfig(path string) (*Config, error) {
+    	file, err := os.Open(path)
+        	if err != nil {
+                		return nil, err
+            }
+            	defer file.Close()
+
+                	var config Config
+                    	if err := json.NewDecoder(file).Decode(&config); err != nil {
+                            		return nil, err
+                        }
+
+                        	return &config, nil
+}
+```
+
+### 2. Полностью переработаем log_service.go
+```go
+package log_service
+
+import (
+    	"context"
+        	"encoding/json"
+            	"flag"
+                	"fmt"
+                    	"log"
+                        	"net"
+                            	"os"
+                                	"path/filepath"
+                                    	"sort"
+                                        	"strings"
+                                            	"time"
+
+                                                	pb "grpc_protoc_v2/exchange"
+                                                    	"google.golang.org/grpc"
+)
+
+var (
+    	port = flag.Int("port", 50051, "The server port")
+)
+
+type grpcserver struct {
+    	pb.UnimplementedSrvExchangeServer
+        	config *Config
+}
+
+type Response struct {
+    	Error  string        `json:"error"`
+        	Result []LogMessage  `json:"result"`
+}
+
+func NewServer(configPath string) (*grpcserver, error) {
+    	config, err := LoadConfig(configPath)
+        	if err != nil {
+                		return nil, fmt.Errorf("failed to load config: %w", err)
+            }
+
+            	return &grpcserver{config: config}, nil
+}
+
+func (s *grpcserver) Command(ctx context.Context, req *pb.DevRequest) (*pb.DevResponse, error) {
+    	log.Printf("Received Command: %v", req.GetCommand())
+        	log.Printf("Received Params: %v", req.GetParams())
+
+            	// Парсим параметры запроса
+                	var requestParams struct {
+                        		GroupName   string `json:"group_name"`
+                                		ServiceName string `json:"service_name"`
+                    }
+                    	if err := json.Unmarshal([]byte(req.GetParams()), &requestParams); err != nil {
+                            		return s.createErrorResponse(pb.StatusCode_Failed, fmt.Sprintf("invalid params format: %v", err))
+                        }
+
+                        	// Формируем путь к логам
+                            	logsPath := filepath.Join(
+                                    		s.config.RootFolder,
+                                            		requestParams.GroupName,
+                                                    		requestParams.ServiceName,
+                                                            		"logs",
+                                )
+
+                                	// Находим последний лог-файл
+                                    	latestLogFile, err := findLatestLogFile(logsPath)
+                                        	if err != nil {
+                                                		return s.createErrorResponse(pb.StatusCode_Failed, fmt.Sprintf("failed to find log file: %v", err))
+                                            }
+
+                                            	if latestLogFile == "" {
+                                                    		return s.createErrorResponse(pb.StatusCode_Failed, "no log files found")
+                                                }
+
+                                                	// Парсим логи
+                                                    	logMessages, err := ParseLogs(filepath.Join(logsPath, latestLogFile))
+                                                        	if err != nil {
+                                                                		return s.createErrorResponse(pb.StatusCode_Failed, fmt.Sprintf("failed to parse logs: %v", err))
+                                                            }
+
+                                                            	// Формируем успешный ответ
+                                                                	response := Response{
+                                                                        		Error:  "",
+                                                                                		Result: logMessages,
+                                                                    }
+
+                                                                    	responseBytes, err := json.Marshal(response)
+                                                                        	if err != nil {
+                                                                                		return s.createErrorResponse(pb.StatusCode_Failed, fmt.Sprintf("failed to marshal response: %v", err))
+                                                                            }
+
+                                                                            	return &pb.DevResponse{
+                                                                                    		Response: string(responseBytes),
+                                                                                            		Code:     pb.StatusCode_Ok,
+                                                                                }, nil
+}
+
+func (s *grpcserver) createErrorResponse(code pb.StatusCode, errorMsg string) (*pb.DevResponse, error) {
+    	response := Response{
+            		Error:  errorMsg,
+                    		Result: nil,
+        }
+
+        	responseBytes, err := json.Marshal(response)
+            	if err != nil {
+                    		return nil, fmt.Errorf("failed to marshal error response: %w", err)
+                }
+
+                	return &pb.DevResponse{
+                        		Response: string(responseBytes),
+                                		Code:     code,
+                    }, nil
+}
+
+func findLatestLogFile(logFolder string) (string, error) {
+    	files, err := os.ReadDir(logFolder)
+        	if err != nil {
+                		return "", fmt.Errorf("failed to read directory: %w", err)
+            }
+
+            	var logFiles []os.FileInfo
+                	for _, file := range files {
+                        		if !file.IsDir() && strings.HasSuffix(file.Name(), ".log") {
+                                    			info, err := file.Info()
+                                                			if err != nil {
+                                                                				continue
+                                                            }
+                                                            			logFiles = append(logFiles, info)
+                                }
+                    }
+
+                    	if len(logFiles) == 0 {
+                            		return "", nil
+                        }
+
+                        	// Сортируем по времени модификации (новые сначала)
+                            	sort.Slice(logFiles, func(i, j int) bool {
+                                    		return logFiles[i].ModTime().After(logFiles[j].ModTime())
+                                })
+
+                                	return logFiles[0].Name(), nil
+}
+
+func StartServer(configPath string) {
+    	flag.Parse()
+
+        	server, err := NewServer(configPath)
+            	if err != nil {
+                    		log.Fatalf("Failed to create server: %v", err)
+                }
+
+                	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
+                    	if err != nil {
+                            		log.Fatalf("failed to listen: %v", err)
+                        }
+
+                        	s := grpc.NewServer()
+                            	pb.RegisterSrvExchangeServer(s, server)
+                                	log.Printf("Server listening at %v", lis.Addr())
+                                    	if err := s.Serve(lis); err != nil {
+                                            		log.Fatalf("failed to serve: %v", err)
+                                        }
+}
+```
+
+### 3. Обновим main.go сервера
+```go
+package main
+
+import (
+    	"grpc/pkg/app/log_service"
+)
+
+func main() {
+    	// Путь к конфигурационному файлу
+        	const configPath = "/path/to/config.json"
+            	log_service.StartServer(configPath)
+}
+```
+
+### 4. Пример конфигурационного файла (config.json)
+```json
+{
+      "root_folder": "/var/services"
+}
+```
+
+### 5. Обновим клиентскую часть (main.go клиента)
+```go
+// В параметрах запроса теперь нужно передавать:
+params := `{
+      "group_name": "media_services",
+        "service_name": "tmi_parser_0"
+}`
+```
+
+### Ключевые изменения:
+
+1. **Конфигурация сервера**:
+   - Путь к корневой папке теперь берется из конфига
+      - Добавлена загрузка конфигурации при старте сервера
+
+      2. **Формат запроса**:
+         - Параметры запроса теперь должны содержать group_name и service_name
+            - Пример: `{"group_name": "media_services", "service_name": "tmi_parser_0"}`
+
+            3. **Поиск логов**:
+               - Логи ищутся по пути: `root_folder/group_name/service_name/logs/`
+                  - Выбирается самый новый файл с расширением .log
+
+                  4. **Формат ответа**:
+                     - Теперь строго соответствует требуемому формату
+                        - В случае ошибки: `{"error": "текст ошибки", "result": null}`
+                           - В случае успеха: `{"error": "", "result": [массив логов]}`
+
+                           5. **Статус код**:
+                              - Передается отдельно от содержимого ответа
+                                 - Клиент должен сначала проверять статус код, затем содержимое ответа
+
+                                 Пример правильного ответа сервера:
+                                 ```json
+                                 {
+                                      "code": "Ok",
+                                        "response": "{\"error\": \"\", \"result\": [{\"channel\": \"channel1\", ...}, {...}]}"
+                                 }
+                                 ```
+
+                                 Или в случае ошибки:
+                                 ```json
+                                 {
+                                      "code": "Failed",
+                                        "response": "{\"error\": \"No log files found\", \"result\": null}"
+                                 }
+                                 ```
+
+                                 Эта реализация теперь:
+                                 1. Корректно обрабатывает пути к лог-файлам
+                                 2. Возвращает логи в указанном формате
+                                 3. Четко разделяет статус операции и содержимое ответа
+                                 4. Гибко настраивается через конфигурационный файл
+                                 }
+                                 }
+}
+}
+}
+)
+                                        }
+                        }
+                }
+}
+                                })
+                        }
+                                                            }
+                                }
+                    }
+            }
+}
+                    }
+                }
+        }
+}
+                                                                                }
+                                                                            }
+                                                                    }
+                                                            }
+                                                }
+                                            }
+                                )
+                        }
+                    }
+}
+            }
+}
+}
+}
+)
+)
+                        }
+            }
+}
+}
+)
